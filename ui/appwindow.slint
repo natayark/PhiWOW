@@ -1,0 +1,23 @@
+
+import {Button, HorizontalBox, VerticalBox} from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    width: 800px;
+    height: 600px;
+    background: black;
+    title: "PhiWOW - 这是什么a";
+    VerticalBox {
+        spacing: 25px;
+        Image {
+            source: @image-url("assets/Pause.png");
+            width: 40px;
+            height: 240px;
+            padding: 40px;
+        }
+        Image {
+            source: @image-url("assets/line.png");
+        }
+
+    }
+    
+}
