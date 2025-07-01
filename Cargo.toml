@@ -1,6 +1,6 @@
 [package]
-name = "qqqqqq"
-version = "0.1.0"
+name = "phiwow"
+version = "0.0.0"
 edition = "2024"
 build = "build.rs"
 
