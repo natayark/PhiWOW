@@ -95,7 +95,7 @@ jobs:
     - name: Align and Sign
       run: |
         SDK="${{github.workspace}}/android-sdk"
-        BT="$SDK/build-tools/30.0.2"
+        BT="$SDK/build-tools/34.0.0"
         $BT/zipalign -f 4 installed_raw.apk installed_aligned.apk
         $BT/apksigner sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android --out installed.apk installed_aligned.apk
 
