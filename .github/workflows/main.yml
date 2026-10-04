@@ -24,7 +24,12 @@ jobs:
       uses: actions-rs/toolchain@v1.0.6
       with:
         toolchain: stable
-        targets: aarch64-linux-android,armv7-linux-androideabi
+        profile: minimal
+
+    - name: Install targets
+      run: |
+        rustup target add aarch64-linux-android
+        rustup target add armv7-linux-androideabi
 
     - name: Install cargo-ndk
       run: cargo install cargo-ndk
