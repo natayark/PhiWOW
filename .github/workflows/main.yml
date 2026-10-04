@@ -62,7 +62,7 @@ jobs:
         mv $SDK/cmdline-tools-tmp/cmdline-tools $SDK/cmdline-tools/latest
         
         # Accept licenses and install build-tools
-        yes | $SDK/cmdline-tools/latest/bin/sdkmanager --sdk_root=$SDK "build-tools;34.0.0" "platforms;android-34" > /dev/null 2>&1 || true
+        yes | $SDK/cmdline-tools/latest/bin/sdkmanager --sdk_root=$SDK "build-tools;34.0.0" "platforms;android-34"
 
         BT="$SDK/build-tools/34.0.0"
         JAR="$SDK/platforms/android-34/android.jar"
