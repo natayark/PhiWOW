@@ -1,0 +1,1678 @@
+#![allow(unused)]
+
+crate::tl_file!("game");
+
+use chinese_number::{ChineseCase, ChineseCountMethod, ChineseVariant, NumberToChinese};
+use super::{
+    draw_background,
+    ending::RecordUpdateState,
+    loading::{BasicPlayer, UpdateFn, UploadFn},
+    request_input, return_input, show_message, take_input, EndingScene, NextScene, Scene,
+};
+use crate::{
+    bin::BinaryReader,
+    config::{Config, Mods},
+    core::{BadNote, Chart, ChartExtra, Effect, Point, Resource, UIElement, BUFFER_SIZE},
+    ext::{draw_text_aligned, draw_text_aligned_opt_width, ease_in_out_quartic, get_latency, parse_time, push_frame_time, screen_aspect, semi_white, RectExt, SafeTexture},
+    fs::FileSystem,
+    gyro::GYRO,
+    info::{ChartFormat, ChartInfo},
+    judge::Judge,
+    parse::{parse_extra, parse_pec, parse_phigros, parse_rpe},
+    time::TimeManager,
+    ui::{RectButton, Ui}
+};
+use anyhow::{bail, Context, Result};
+use concat_string::concat_string;
+use macroquad::{prelude::*, window::InternalGlContext};
+use sasa::{Music, MusicParams};
+use serde::{Deserialize, Serialize};
+use std::{
+    io::Cursor,
+    ops::{DerefMut, Range},
+    sync::Arc,
+};
+use tracing::{debug, warn};
+
+const PAUSE_CLICK_INTERVAL: f32 = 0.7;
+
+#[cfg(feature = "closed")]
+mod inner;
+#[cfg(feature = "closed")]
+use inner::*;
+
+pub const WAIT_TIME: f32 = 0.5;
+const AFTER_TIME: f32 = 0.7;
+const PAUSE_BACKGROUND_ALPHA: f32 = 0.6;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimpleRecord {
+    pub score: u32,
+    pub accuracy: f32,
+    pub full_combo: bool,
+}
+
+impl SimpleRecord {
+    pub fn update(&mut self, other: &SimpleRecord) -> bool {
+        let mut changed = false;
+        if other.score > self.score {
+            self.score = other.score;
+            changed = true;
+        }
+        if other.accuracy > self.accuracy {
+            self.accuracy = other.accuracy;
+            changed = true;
+        }
+        if other.full_combo & !self.full_combo {
+            self.full_combo = other.full_combo;
+            changed = true;
+        }
+        changed
+    }
+}
+
+fn fmt_time(t: f32) -> String {
+    let f = t < 0.;
+    let t = t.abs();
+    let secs = t % 60.;
+    let mut t = (t / 60.) as u64;
+    let mins = t % 60;
+    t /= 60;
+    let hrs = t % 100;
+    format!("{}{hrs:02}:{mins:02}:{secs:05.2}", if f { "-" } else { "" })
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    fn on_game_start();
+}
+
+#[derive(PartialEq, Eq)]
+pub enum GameMode {
+    Normal,
+    TweakOffset,
+    Exercise,
+    NoRetry,
+    View,
+}
+
+#[derive(Clone)]
+enum State {
+    Starting,
+    BeforeMusic,
+    Playing,
+    Ending,
+}
+
+pub struct PauseRewind {
+    time: Option<f64>,
+    duration: Option<f64>,
+    dim: bool,
+}
+
+pub struct GameScene {
+    should_exit: bool,
+    next_scene: Option<NextScene>,
+
+    pub mode: GameMode,
+    pub res: Resource,
+    pub chart: Chart,
+    pub judge: Judge,
+    pub gl: InternalGlContext<'static>,
+    player: Option<BasicPlayer>,
+    info_offset: f32,
+    effects: Vec<Effect>,
+
+    first_in: bool,
+    exercise_range: Range<f32>,
+    exercise_press: Option<(i8, u64)>,
+    exercise_btns: (RectButton, RectButton),
+
+    pub music: Music,
+
+    state: State,
+    pub last_update_time: f64,
+    pause_rewind: PauseRewind,
+    pause_first_time: f32,
+
+    pub bad_notes: Vec<BadNote>,
+
+    upload_fn: Option<UploadFn>,
+    update_fn: Option<UpdateFn>,
+
+    pub touch_points: Vec<(f32, f32)>,
+
+    hp_prev: f32,
+    hp_color_r: f32,
+    hp_color_b: f32,
+}
+
+macro_rules! reset {
+    ($self:ident, $res:expr, $tm:ident) => {{
+        $self.bad_notes.clear();
+        $self.judge.reset();
+        $self.chart.reset();
+        $res.reset();
+        $self.hp_prev = 1.0;
+        $self.hp_color_r = 0.0;
+        $self.hp_color_b = 1.0;
+        $self.music.pause()?;
+        $self.music.seek_to(0.)?;
+        $tm.speed = $res.config.speed as _;
+        $tm.reset();
+        $self.last_update_time = $tm.now();
+        $self.state = State::Starting;
+        $self.pause_rewind = PauseRewind {
+            time: None,
+            duration: None,
+            dim: false
+        };
+    }};
+}
+
+macro_rules! reset_music_speed {
+    ($self:ident, $res:expr, $tm:ident) => {{
+        debug!("recreate music");
+        $self.music = $res.audio.create_music(
+            $res.music.clone(),
+            MusicParams {
+                amplifier: $res.config.volume_music as _,
+                playback_rate: $res.config.speed as _,
+                ..Default::default()
+            },
+        ).expect("failed to create music");
+        $tm.pause();
+        $self.music.pause().ok();
+        let now = $tm.now();
+        $tm.speed = $res.config.speed as _;
+        $tm.seek_to(now);
+        $self.music.seek_to(now).ok();
+    }};
+}
+
+
+impl GameScene {
+    pub const BEFORE_TIME: f32 = 0.7;
+    pub const BEFORE_DURATION: f32 = 1.2;
+    pub const WAIT_AFTER_TIME: f32 = AFTER_TIME + 0.3;
+    pub const FADEOUT_TIME: f32 = WAIT_TIME + Self::WAIT_AFTER_TIME;
+
+    pub async fn load_chart_bytes(fs: &mut dyn FileSystem, info: &ChartInfo) -> Result<Vec<u8>> {
+        if let Ok(bytes) = fs.load_file(&info.chart).await {
+            return Ok(bytes);
+        }
+        if let Some(name) = info.chart.strip_suffix(".pec") {
+            if let Ok(bytes) = fs.load_file(&concat_string!(name, ".json")).await {
+                return Ok(bytes);
+            }
+        }
+        bail!("Cannot find chart file")
+    }
+
+    pub fn int_to_roman(mut num: u32) -> String {
+        if num.to_string() == "0" {
+            return "-".to_string()
+        };
+        let mut roman: String = String::new();
+        let roman_numerals = [
+            (1000000, "M￣"),
+            (900000, "CM￣"),
+            (500000, "D￣"),
+            (400000, "CD￣"),
+            (100000, "C￣"),
+            (90000, "XC￣"),
+            (50000, "L￣"),
+            (40000, "XL￣"),
+            (10000, "X￣"),
+            (1000, "M"),
+            (900, "CM"),
+            (500, "D"),
+            (400, "CD"),
+            (100, "C"),
+            (90, "XC"),
+            (50, "L"),
+            (40, "XL"),
+            (10, "X"),
+            (9, "IX"),
+            (5, "V"),
+            (4, "IV"),
+            (1, "I"),
+        ];
+    
+        for &(value, symbol) in roman_numerals.iter() {
+            while num >= value {
+                roman.push_str(symbol);
+                num -= value;
+            }
+        }
+        roman
+        
+    }
+
+    pub fn int_to_chinese(num: u32) -> String {
+        num.to_chinese(ChineseVariant::Simple, ChineseCase::Lower, ChineseCountMethod::TenThousand).unwrap()
+    }
+
+    pub fn float_to_chinese(num: f32) -> String {
+        let chinese_digits = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+        let chinese_units = ["", "十", "百", "千", "万", "十万", "百万", "千万", "亿"];
+    
+        let integer_part = num.trunc() as u64;
+        let decimal_part = (num.fract() * 100.0).round() / 100.0;
+    
+        let mut result = String::new();
+    
+        // 整数
+        if integer_part == 0 {
+            result.push_str(chinese_digits[0]);
+        } else {
+            let mut n = integer_part;
+            let mut unit_index = 0;
+            let mut need_zero = false;
+    
+            while n > 0 {
+                let digit = (n % 10) as usize;
+                if digit != 0 {
+                    if need_zero {
+                        result.insert(0, '零');
+                        need_zero = false;
+                    }
+                    result.insert_str(0, chinese_units[unit_index]);
+                    result.insert_str(0, chinese_digits[digit]);
+                } else {
+                    if !result.starts_with("零") {
+                        need_zero = true;
+                    }
+                }
+                n /= 10;
+                unit_index += 1;
+            }
+    
+            if result.starts_with("一十") {
+                result.remove(0);
+            }
+            if result.ends_with("零") {
+                result.pop();
+            }
+        }
+    
+        // 小数
+        if decimal_part > 0.0 {
+            result.push('点');
+            let decimal_str = decimal_part.to_string();
+            for c in decimal_str.chars().skip(2) { // 跳过"0."
+                let digit = c.to_digit(10).unwrap() as usize;
+                result.push_str(chinese_digits[digit]);
+            }
+        }
+    
+        result
+    }
+    
+
+    pub async fn load_chart(fs: &mut dyn FileSystem, info: &ChartInfo, config: &Config) -> Result<(Chart, ChartFormat)> {
+        let extra = if config.render_extra {
+            if let Some(extra) = fs.load_file("extra.json").await.ok().map(String::from_utf8).transpose()? {
+                parse_extra(&extra, fs).await.context("Failed to parse extra")?
+            } else if let Some(extra) = fs.load_file("extra1.json").await.ok().map(String::from_utf8).transpose()? {
+                parse_extra(&extra, fs).await.context("Failed to parse extra1")?
+            } else {
+                ChartExtra::default()
+            }
+        } else {
+            ChartExtra::default()
+        };
+        let bytes = Self::load_chart_bytes(fs, info).await.context("Failed to load chart")?;
+        let format = info.format.clone().unwrap_or_else(|| {
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                if text.starts_with('{') {
+                    if text.contains("\"META\"") {
+                        ChartFormat::Rpe
+                    } else {
+                        ChartFormat::Pgr
+                    }
+                } else {
+                    ChartFormat::Pec
+                }
+            } else {
+                ChartFormat::Pbc
+            }
+        });
+        let mut chart = match format {
+            ChartFormat::Rpe => parse_rpe(&String::from_utf8_lossy(&bytes), fs, extra).await,
+            ChartFormat::Pgr => parse_phigros(&String::from_utf8_lossy(&bytes), extra),
+            ChartFormat::Pec => parse_pec(&String::from_utf8_lossy(&bytes), extra),
+            ChartFormat::Pbc => {
+                let mut r = BinaryReader::new(Cursor::new(bytes));
+                r.read()
+            }
+        }?;
+        chart.load_textures(fs).await?;
+        Ok((chart, format))
+    }
+
+    pub async fn new(
+        preload_chart: Option<(Chart, ChartFormat)>,
+        mode: GameMode,
+        info: ChartInfo,
+        mut config: Config,
+        mut fs: Box<dyn FileSystem>,
+        player: Option<BasicPlayer>,
+        background: SafeTexture,
+        illustration: SafeTexture,
+        upload_fn: Option<UploadFn>,
+        update_fn: Option<UpdateFn>,
+    ) -> Result<Self> {
+        match mode {
+            GameMode::TweakOffset => {
+                config.mods.insert(Mods::AUTOPLAY);
+                config.volume_music = config.volume_music.max(0.5);
+                config.volume_sfx = config.volume_sfx.max(0.5);
+            }
+            _ => {}
+        }
+        let (mut chart, _) = if let Some((chart, format)) = preload_chart {
+            (chart, format)
+        } else {
+            Self::load_chart(fs.deref_mut(), &info, &config).await?
+        };
+        let effects = std::mem::take(&mut chart.extra.global_effects);
+        if config.fxaa {
+            chart
+                .extra
+                .effects
+                .push(Effect::new(0.0..f32::INFINITY, include_str!("fxaa.glsl"), Vec::new(), false).unwrap());
+        }
+
+        let mut judge = Judge::new(&chart);
+
+        let info_offset = info.offset;
+        let mut res = Resource::new(
+            config,
+            info,
+            fs,
+            player.as_ref().and_then(|it| it.avatar.clone()),
+            background,
+            illustration,
+            chart.extra.effects.is_empty() && effects.is_empty(),
+        )
+        .await
+        .context("Failed to load resources")?;
+        let offset = chart.offset + info_offset + res.config.offset;
+        let exercise_range = offset + res.config.play_start_time..res.track_length;
+        
+        // Prepare extra sfx from chart.hitsounds
+        chart.hitsounds.drain().for_each(|(name, clip)| {
+            if let Ok(clip) = res.audio.create_sfx(clip, Some(BUFFER_SIZE)) {
+                res.extra_sfxs.insert(name, clip);
+            }
+        });
+
+        let music = Self::new_music(&mut res)?;
+        judge.set_hp_duration(res.track_length * 1000.0);
+        let mut game = Self {
+            should_exit: false,
+            next_scene: None,
+
+            mode,
+            res,
+            chart,
+            judge,
+            gl: unsafe { get_internal_gl() },
+            player,
+            effects,
+            info_offset,
+
+            first_in: false,
+            exercise_range,
+            exercise_press: None,
+            exercise_btns: (RectButton::new(), RectButton::new()),
+
+            music,
+
+            state: State::Starting,
+            last_update_time: 0.,
+            pause_rewind: PauseRewind {
+                time: None,
+                duration: None,
+                dim: false
+            },
+            pause_first_time: f32::NEG_INFINITY,
+
+            bad_notes: Vec::new(),
+
+            upload_fn,
+            update_fn,
+
+            touch_points: Vec::new(),
+
+            hp_prev: 1.0,
+            hp_color_r: 0.0,
+            hp_color_b: 1.0,
+        };
+        Ok(game)
+    }
+
+    fn new_music(res: &mut Resource) -> Result<Music> {
+        res.audio.create_music(
+            res.music.clone(),
+            MusicParams {
+                amplifier: res.config.volume_music as _,
+                playback_rate: res.config.speed as _,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn touch_scale(&self) -> f32 {
+        (screen_width() / screen_height()) / self.res.aspect_ratio
+    }
+
+    fn ui(&mut self, ui: &mut Ui, tm: &mut TimeManager) -> Result<()> {
+        let time = tm.now() as f32;
+        let p = match self.state {
+            State::Starting => {
+                if time <= Self::BEFORE_TIME {
+                    1. - (1. - time / Self::BEFORE_TIME).clamp(0., 1.).powi(3)
+                } else {
+                    1.
+                }
+            }
+            State::BeforeMusic => 1.,
+            State::Playing => 1.,
+            State::Ending => {
+                let t = time - self.res.track_length - WAIT_TIME;
+                1. - (t / (Self::WAIT_AFTER_TIME)).clamp(0., 1.).powi(2)
+            }
+        };
+        let c = Color::new(1., 1., 1., self.res.alpha);
+        let res = &mut self.res;
+        let aspect_ratio = res.aspect_ratio;
+        let screen_aspect = screen_aspect();
+        let scale_ratio = 1.777777;
+        let top = -1.;
+        let eps = 2e-2;
+        let margin = 0.0425 * scale_ratio;
+        let pause_w = 0.011 * scale_ratio;
+        let pause_h = pause_w * 3.5;
+        let pause_center = Point::new(-aspect_ratio + 0.0525 * scale_ratio, top + eps * 3.6454 - (1. - p) * 0.4 + pause_h / 2.);
+        if res.config.interactive
+            && !tm.paused()
+            && self.pause_rewind.time.is_none()
+            && matches!(self.state, State::Playing)
+            && Judge::get_touches(res.config.chart_ratio).iter().any(|touch| {
+                touch.phase == TouchPhase::Started && {
+                    let p = touch.position;
+                    let p = Point::new(p.x * screen_aspect, p.y * screen_aspect);
+                    (pause_center - p).norm() < 0.05
+                }
+            })
+        {
+            let t = tm.now() as f32;
+            if t - self.pause_first_time > PAUSE_CLICK_INTERVAL && res.config.double_click_to_pause {
+                self.pause_first_time = t;
+            } else {
+                self.pause_first_time = f32::NEG_INFINITY;
+                if !self.music.paused() {
+                    self.music.pause()?;
+                }
+                tm.pause();
+            }
+        }
+        if tm.now() as f32 - self.pause_first_time <= PAUSE_CLICK_INTERVAL {
+            ui.fill_circle(pause_center.x, pause_center.y, 0.05 * scale_ratio, Color::new(1., 1., 1., 0.5));
+        }
+
+        let score = (self.judge.score() / 1_000_000. * res.info.score_total as f64).round() as u32;
+        let score = if res.config.roman {
+            Self::int_to_roman(score)
+        } else if res.config.chinese {
+            Self::int_to_chinese(score)
+        }
+        else {
+            let width = res.info.score_total.to_string().len();
+            format!("{:0>width$}", score, width = width)
+        };
+        let score_top = top + eps * 2.8125 - (1. - p) * 0.4;
+        let score_right = aspect_ratio - margin + 0.001;
+        ui.text("AA").color(Color::new(0., 0., 0., 0.)).draw(); //Fix first text disappear
+        let mut text_size = 0.71 * scale_ratio;
+        let mut text = ui.text(&score).size(text_size);
+        let max_width = 0.55 * aspect_ratio;
+        let text_width = text.measure().w;
+        if text_width > max_width {
+            text_size *= max_width / text_width
+        }
+        self.chart.with_element(ui, res, UIElement::Score, Some((score_right, score_top)), Some((score_right, score_top)), |ui, color| {
+            if res.config.render_ui_score {
+                ui.text(score)
+                    .pos(score_right, score_top)
+                    .anchor(1., 0.)
+                    .size(text_size)
+                    .color(Color { a: color.a * c.a, ..color })
+                    .draw();
+            }
+            if res.config.show_acc {
+                ui.text(format!("{:05.2}%", self.judge.real_time_accuracy() * 100.))
+                    .pos(aspect_ratio - margin, top + eps * 2.2 - (1. - p) * 0.4 + 0.07 + 0.05)
+                    .anchor(1., 0.)
+                    .size(0.4 * scale_ratio)
+                    .color(Color { a: color.a * c.a * 0.7, ..color })
+                    .draw();
+            }
+        });
+        if res.config.render_ui_pause {
+            self.chart.with_element(ui, res, UIElement::Pause, Some((pause_center.x - pause_w * 1.5, pause_center.y - pause_h * 0.5)), Some((pause_center.x - pause_w * 1.5, pause_center.y - pause_h * 0.5)), |ui, color| {
+                let mut r = Rect::new(pause_center.x - pause_w / 2., pause_center.y - pause_h / 2., pause_w, pause_h);
+                //let ct = pause_center.coords;
+                let c = Color { a: color.a * c.a, ..color };
+                
+                r.x -= pause_w;
+                ui.fill_rect(r, c);
+                r.x += pause_w * 2.;
+                ui.fill_rect(r, c);
+            });
+        }
+        if self.judge.combo() >= 3 && res.config.render_ui_combo {
+            let combo = if res.config.roman {
+                Self::int_to_roman(self.judge.combo())
+            } else if res.config.chinese {
+                Self::int_to_chinese(self.judge.combo())
+            }
+            else {
+                self.judge.combo().to_string()
+            };
+            let mut text_size = 0.98 * scale_ratio;
+            let max_width = 0.55 * aspect_ratio;
+            let mut text = ui.text(&combo)
+                .size(text_size)
+                .color(Color::new(0., 0., 0., 0.));
+            let ct = text.measure().center();
+            let text_width = text.measure().w;
+            if text_width > max_width {
+                text_size *= max_width / text_width
+            }
+            let combo_y = top + eps * 1.55 - (1. - p) * 0.4 + ct.y;
+            let btm = text.anchor(0.5, 0.5).pos(0., combo_y).draw().bottom() + 0.015;
+            self.chart.with_element(ui, res, UIElement::ComboNumber, Some((0., combo_y)), Some((0., combo_y)), |ui, color| {
+                ui.text(&combo)
+                    .pos(0., combo_y)
+                    .anchor(0.5, 0.5)
+                    .color(Color { a: color.a * c.a, ..color })
+                    .size(text_size)
+                    .multiline()
+                    .draw();
+            });
+            let mut text = ui.text(&res.config.combo).size(0.34 * scale_ratio);
+            let ct = text.measure().center();
+            self.chart.with_element(ui, res, UIElement::Combo, Some((0., btm + ct.y)), Some((0., btm + ct.y)), |ui, color| {
+                if res.config.combo.len() > 50 {
+                    return;
+                }
+                draw_text_aligned_opt_width(ui, &res.config.combo, 0., btm + ct.y, (0.5, 0.5), 0.34 * scale_ratio, Color { a: color.a * c.a, ..color }, 0.55 * aspect_ratio);
+            });
+        }
+        let lf = -aspect_ratio + margin;
+        let bt = -top - eps * 3.5 + (1. - p) * 0.4;
+        if res.config.render_ui_name {
+            self.chart.with_element(ui, res, UIElement::Name, Some((lf, bt)), Some((lf, bt)), |ui, color| {
+                draw_text_aligned_opt_width(ui, &res.info.name, lf, bt, (0., 1.), 0.505 * scale_ratio, Color { a: color.a * c.a, ..color }, 0.9 * aspect_ratio);
+            });
+        }
+        if res.config.render_ui_level {
+            self.chart.with_element(ui, res, UIElement::Level, Some((-lf, bt)), Some((-lf, bt)), |ui, color| {
+                draw_text_aligned_opt_width(ui, &res.info.level, -lf, bt, (1., 1.), 0.505 * scale_ratio, Color { a: color.a * c.a, ..color }, 0.9 * aspect_ratio);
+            });
+        }
+        if !res.config.watermark.is_empty() {
+            draw_text_aligned_opt_width(ui, &res.config.watermark, 0., -top * 0.98 + (1. - p) * 0.4, (0.5, 1.), 0.25 * scale_ratio, semi_white(0.5 * c.a), 2.0 * aspect_ratio);
+            if res.config.chart_ratio <= 0.95 {
+                draw_text_aligned_opt_width(ui, &res.config.watermark, 0., (-top * 0.98 + (1. - p) * 0.4) / res.config.chart_ratio, (0.5, 1.), 0.25 * scale_ratio / res.config.chart_ratio, semi_white(0.5 * c.a), 2.0 * aspect_ratio);
+            }
+        };
+        let hw = 0.003;
+        let height = eps * 1.0;
+        let offset = self.chart.offset + self.info_offset + res.config.offset;
+        let dest = (aspect_ratio * 2. * (res.time - self.exercise_range.start + offset) / (self.exercise_range.end - self.exercise_range.start)).max(0.).min(aspect_ratio * 2.);
+        if res.config.render_ui_bar {
+            self.chart.with_element(ui, res, UIElement::Bar, Some((-aspect_ratio, top + height / 2.)), Some((-aspect_ratio, top + height / 2.)), |ui, color| {
+                //let ct = Vector::new(0., top + height / 2.);
+                ui.fill_rect(
+                    Rect::new(-aspect_ratio, top, dest, height),
+                    Color{ a: color.a * c.a, ..color },
+                );
+                ui.fill_rect(Rect::new(-aspect_ratio + dest - hw, top, hw * 2., height), Color::new(0.95, 0.95, 0.95, color.a * c.a));
+            });
+        }
+        // HP bar
+        if res.config.show_hp_bar {
+            let hp = self.judge.hp() / 100.0;
+            let bar_width = 0.015 * aspect_ratio;
+            let bar_height = 2.0;
+            let bar_x = -aspect_ratio;
+            let bar_y = -1.0;
+            let fill_height = bar_height * hp;
+            // Background
+            ui.fill_rect(
+                Rect::new(bar_x, bar_y, bar_width, bar_height),
+                Color::new(0.2, 0.2, 0.2, c.a * 0.8),
+            );
+            // Direction-based color with smooth transition
+            let blend_speed = 0.15;
+            if hp > self.hp_prev + 0.001 {
+                // Rising → blue
+                self.hp_color_r = (self.hp_color_r - blend_speed).max(0.0);
+                self.hp_color_b = (self.hp_color_b + blend_speed).min(1.0);
+            } else if hp < self.hp_prev - 0.001 {
+                // Falling → red
+                self.hp_color_r = (self.hp_color_r + blend_speed).min(1.0);
+                self.hp_color_b = (self.hp_color_b - blend_speed).max(0.0);
+            }
+            self.hp_prev = hp;
+            let hp_color = Color::new(self.hp_color_r, 0.15, self.hp_color_b, c.a);
+            ui.fill_rect(
+                Rect::new(bar_x, bar_y + bar_height - fill_height, bar_width, fill_height),
+                hp_color,
+            );
+        }
+        // Judgement detail
+        if res.config.show_judgement_detail {
+            let counts = self.judge.counts();
+            let early = self.judge.early();
+            let late = self.judge.late();
+            let good = counts[1];
+            let early_good = early.min(good);
+            let late_good = late.min(good.saturating_sub(early_good));
+            let avg_early = self.judge.avg_early_delay();
+            let avg_late = self.judge.avg_late_delay();
+            let avg_all = self.judge.avg_all_delay();
+
+            let detail_x = aspect_ratio - 0.04;
+            let line_height = 0.06;
+            let text_size = 0.28 * scale_ratio;
+            let num_size = 0.24 * scale_ratio;
+            let detail_y_start = -0.2;
+
+            // Early delay at top
+            let early_text = format!("{:.1}ms", avg_early * 1000.0);
+            ui.text(&early_text)
+                .pos(detail_x, detail_y_start - line_height)
+                .anchor(1., 0.)
+                .size(num_size)
+                .color(Color::new(0.5, 0.8, 1.0, c.a * 0.7))
+                .draw();
+
+            // Numbers only, from top to bottom: Bad, EarlyGood, Perfect(avg), LateGood, Miss
+            let rows = [
+                (counts[2], Color::new(1.0, 0.5, 0.0, c.a)),
+                (early_good, Color::new(0.5, 0.8, 1.0, c.a)),
+                (counts[0], Color::new(1.0, 1.0, 0.0, c.a)),
+                (late_good, Color::new(0.5, 0.8, 1.0, c.a)),
+                (counts[3], Color::new(0.8, 0.2, 0.2, c.a)),
+            ];
+
+            for (i, (count, color)) in rows.iter().enumerate() {
+                let y = detail_y_start + i as f32 * line_height;
+                let text = format!("{}", count);
+                ui.text(&text)
+                    .pos(detail_x, y)
+                    .anchor(1., 0.)
+                    .size(text_size)
+                    .color(*color)
+                    .draw();
+            }
+
+            // Average delay to the left of Perfect (row index 2)
+            let avg_text = format!("{:.1}", avg_all * 1000.0);
+            let perfect_y = detail_y_start + 2 as f32 * line_height;
+            ui.text(&avg_text)
+                .pos(detail_x - 0.08, perfect_y)
+                .anchor(1., 0.)
+                .size(num_size)
+                .color(Color::new(1.0, 1.0, 0.5, c.a * 0.7))
+                .draw();
+
+            // Late delay at bottom
+            let late_text = format!("{:.1}ms", avg_late * 1000.0);
+            ui.text(&late_text)
+                .pos(detail_x, detail_y_start + 5 as f32 * line_height)
+                .anchor(1., 0.)
+                .size(num_size)
+                .color(Color::new(0.5, 0.8, 1.0, c.a * 0.7))
+                .draw();
+        }
+        Ok(())
+    }
+
+    fn overlay_ui(&mut self, ui: &mut Ui, tm: &mut TimeManager) -> Result<()> {
+        let c = semi_white(self.res.alpha);
+        let res = &mut self.res;
+        for pos in &self.touch_points {
+            ui.fill_circle(pos.0, pos.1, 0.04, Color { a: 0.4, ..BLUE });
+        }
+        #[cfg(feature = "play")]
+        if res.config.shake_play_mode && matches!(self.state, State::Playing) {
+            let acc = GYRO.lock().unwrap().get_current_acceleration().abs();
+            res.shake_play_mode_deque.push_back((tm.real_time(), acc));
+            while res.shake_play_mode_deque.front().is_some_and(|it| tm.real_time() - it.0 > 1.0) {
+                res.shake_play_mode_deque.pop_front();
+            }
+            let none_gt_1 = res.shake_play_mode_deque.iter().all(|(_, a)| *a <= 1.0);
+            if none_gt_1 && !is_key_down(KeyCode::Enter) {
+                res.shake_play_paused = true;
+                if !tm.paused() {
+                    tm.pause();
+                    self.music.pause()?;
+                    debug!("Shake Mode: Paused");
+                }
+                ui.text(tl!("shake-to-resume"))
+                    .pos(0., 0.)
+                    .anchor(0.5, 0.5)
+                    .size(1.0)
+                    .color(semi_white(1.0))
+                    .draw();
+                return Ok(());
+            } else if tm.paused() && res.shake_play_paused {
+                res.shake_play_paused = false;
+                tm.resume();
+                self.music.play()?;
+                debug!("Shake Mode: Resumed");
+            }
+        }
+        if tm.paused() {
+            let o = if matches!(self.mode, GameMode::Exercise | GameMode::TweakOffset) { -0.3 } else { 0. };
+            let s = 0.06;
+            let w = 0.05;
+            let no_retry = self.mode == GameMode::NoRetry;
+            draw_texture_ex(
+                *res.icon_back,
+                -s * 3. - w,
+                -s + o,
+                c,
+                DrawTextureParams {
+                    dest_size: Some(vec2(s * 2., s * 2.)),
+                    ..Default::default()
+                },
+            );
+            draw_texture_ex(
+                *res.icon_retry,
+                -s,
+                -s + o,
+                if no_retry { semi_white(res.alpha * 0.6) } else { c },
+                DrawTextureParams {
+                    dest_size: Some(vec2(s * 2., s * 2.)),
+                    ..Default::default()
+                },
+            );
+            draw_texture_ex(
+                *res.icon_resume,
+                s + w,
+                -s + o,
+                c,
+                DrawTextureParams {
+                    dest_size: Some(vec2(s * 2., s * 2.)),
+                    ..Default::default()
+                },
+            );
+            if res.config.interactive {
+                let mut clicked = None;
+                for touch in Judge::get_touches(1.0) {
+                    if touch.phase != TouchPhase::Started {
+                        continue;
+                    }
+                    let p = touch.position;
+                    let p = Point::new(p.x, p.y);
+                    for i in -1..=1 {
+                        let ct = Point::new((s * 2. + w) * i as f32, o);
+                        let d = p - ct;
+                        if d.x.abs() <= s && d.y.abs() <= s {
+                            clicked = Some(i);
+                            break;
+                        }
+                    }
+                }
+                if no_retry && clicked == Some(0) {
+                    clicked = None;
+                }
+                if clicked.map_or(false, |it| it != -1) && (tm.speed - res.config.speed as f64).abs() > 1e-3 {
+                    reset_music_speed!(self, res, tm);
+                }
+                match clicked {
+                    Some(-1) => {
+                        self.should_exit = true;
+                    }
+                    Some(0) => {
+                        reset!(self, res, tm);
+                        self.pause_rewind = PauseRewind {
+                            time: Some(tm.now()),
+                            duration: Some(0.1),
+                            dim: false,
+                        };
+                        res.disable_hit_fx = true;
+                    }
+                    Some(1) => {
+                        if self.mode == GameMode::Exercise && tm.now() > self.exercise_range.end as f64 && self.exercise_range.end - 0.1 < res.track_length {
+                            tm.seek_to(self.exercise_range.start as f64);
+                            self.music.seek_to(self.exercise_range.start as f64)?;
+                        }
+                        self.music.play()?;
+                        let now = tm.now();
+                        tm.speed = res.config.speed as _;
+                        tm.resume();
+                        tm.seek_to(now - 1.);
+                        self.music.seek_to(now - 1.)?;
+                        self.pause_rewind = PauseRewind {
+                            time: Some(tm.now()),
+                            duration: Some(1.0),
+                            dim: true
+                        };
+                        self.res.disable_hit_fx = true;
+                    }
+                    _ => {}
+                }
+            }
+            if matches!(self.mode, GameMode::Exercise | GameMode::TweakOffset) {
+                let asp = self.touch_scale();
+                for touch in ui.ensure_touches() {
+                    touch.position *= asp;
+                }
+                if matches!(self.mode, GameMode::Exercise) {
+                    ui.scope(|ui| {
+                        ui.dx(0.3);
+                        ui.dy(-0.3);
+                        ui.slider(tl!("speed"), 0.1..2.0, 0.05, &mut self.res.config.speed, Some(0.5));
+                    });
+                }
+                ui.dy(0.06);
+                let hw = 0.7;
+                let h = 0.06;
+                let eh = 0.12;
+                let rad = 0.03;
+                let sp = self.offset().min(0.);
+                ui.fill_rect(Rect::new(-hw, -h, hw * 2., h * 2.), Color::new(0.4, 0.4, 0.4, 1.));
+                let st = -hw + (self.exercise_range.start - sp) / (self.res.track_length - sp) * hw * 2.;
+                let en = -hw + (self.exercise_range.end - sp) / (self.res.track_length - sp) * hw * 2.;
+                let t = tm.now() as f32;
+                let cur = -hw + (t - sp) / (self.res.track_length - sp) * hw * 2.;
+                ui.fill_rect(Rect::new(st, -h, en - st, h * 2.), Color::new(0.6, 0.6, 0.6, 1.));
+                ui.fill_rect(Rect::new(st, -eh, 0., eh + h).feather(0.005), Color::new(0.66, 0.78, 0.98, 1.));
+                ui.fill_circle(st, -eh, rad, Color::new(0.66, 0.78, 0.98, 1.));
+                if self.exercise_press.is_none() {
+                    let r = ui.rect_to_global(Rect::new(st, -eh, 0., 0.).feather(rad));
+                    self.exercise_press = Judge::get_touches(1.0)
+                        .iter()
+                        .find(|it| it.phase == TouchPhase::Started && r.contains(it.position))
+                        .map(|it| (-1, it.id));
+                }
+                ui.fill_rect(Rect::new(en, -h, 0., eh + h).feather(0.005), Color::new(1., 0.34, 0.54, 1.));
+                ui.fill_circle(en, eh, rad, Color::new(1., 0.34, 0.54, 1.));
+                if self.exercise_press.is_none() {
+                    let r = ui.rect_to_global(Rect::new(en, eh, 0., 0.).feather(rad));
+                    self.exercise_press = Judge::get_touches(1.0)
+                        .iter()
+                        .find(|it| it.phase == TouchPhase::Started && r.contains(it.position))
+                        .map(|it| (1, it.id));
+                }
+                ui.fill_rect(Rect::new(cur, -h, 0., h * 2.).feather(0.005), Color::new(0.9, 0.9, 0.9, 1.));
+                ui.fill_circle(cur, 0., rad, Color::new(0.95, 0.95, 0.95, 1.));
+                if self.exercise_press.is_none() {
+                    let r = ui.rect_to_global(Rect::new(cur, 0., 0., 0.).feather(rad));
+                    self.exercise_press = Judge::get_touches(1.0)
+                        .iter()
+                        .find(|it| it.phase == TouchPhase::Started && r.contains(it.position))
+                        .map(|it| (0, it.id));
+                }
+                ui.text(fmt_time(t)).pos(0., -0.23).anchor(0.5, 0.).size(0.8).draw();
+                if self.pause_rewind.time.is_some() {
+                    self.exercise_press = None;
+                }
+                if let Some((ctrl, id)) = &self.exercise_press {
+                    if let Some(touch) = Judge::get_touches(1.0).iter().rfind(|it| it.id == *id) {
+                        let x = touch.position.x;
+                        let p = (x + hw) / (hw * 2.) * (self.res.track_length - sp) + sp;
+                        let p = if self.res.track_length - sp <= 3. || *ctrl == 0 {
+                            p.clamp(sp, self.res.track_length)
+                        } else {
+                            p.clamp(
+                                if *ctrl == -1 { sp } else { self.exercise_range.start + 3. },
+                                if *ctrl == -1 {
+                                    self.exercise_range.end - 3.
+                                } else {
+                                    self.res.track_length
+                                },
+                            )
+                        };
+                        if *ctrl == 0 {
+                            tm.seek_to(p as f64);
+                            self.music.seek_to(p as f64)?;
+                        } else {
+                            *(if *ctrl == -1 {
+                                &mut self.exercise_range.start
+                            } else {
+                                &mut self.exercise_range.end
+                            }) = p;
+                        }
+                        if matches!(touch.phase, TouchPhase::Cancelled | TouchPhase::Ended) {
+                            self.exercise_press = None;
+                        }
+                    }
+                }
+                ui.dy(0.2);
+                let r = ui.text(tl!("to")).size(0.8).anchor(0.5, 0.).draw();
+                let mut tx = ui
+                    .text(fmt_time(self.exercise_range.start))
+                    .pos(r.x - 0.02, 0.)
+                    .anchor(1., 0.)
+                    .size(0.8)
+                    .color(BLACK);
+                let re = tx.measure();
+                self.exercise_btns.0.set(tx.ui, re);
+                tx.ui
+                    .fill_rect(re.feather(0.01), Color::new(1., 1., 1., if self.exercise_btns.0.touching() { 0.5 } else { 1. }));
+                tx.draw();
+
+                let mut tx = ui
+                    .text(fmt_time(self.exercise_range.end))
+                    .pos(r.right() + 0.02, 0.)
+                    .size(0.8)
+                    .color(BLACK);
+                let re = tx.measure();
+                self.exercise_btns.1.set(tx.ui, re);
+                tx.ui
+                    .fill_rect(re.feather(0.01), Color::new(1., 1., 1., if self.exercise_btns.1.touching() { 0.5 } else { 1. }));
+                tx.draw();
+                for touch in ui.ensure_touches() {
+                    touch.position /= asp;
+                }
+            }
+        }
+        if let PauseRewind {
+            time: Some(time),
+            duration: Some(duration),
+            dim
+        } = self.pause_rewind {
+            let dt = tm.now() - time;
+            let t = duration - dt;
+            if t <= 0. {
+                self.pause_rewind = PauseRewind {
+                    time: None,
+                    duration: None,
+                    dim: false
+                };
+                self.res.disable_hit_fx = false;
+            } else if dim {
+                let a = (t / duration).clamp(0.0, 1.0) * PAUSE_BACKGROUND_ALPHA as f64;
+                let h = 1. / self.res.aspect_ratio;
+                draw_rectangle(-1., -h, 2., h * 2., Color::new(0., 0., 0., a as f32));
+                ui.text((t.ceil() as i32).to_string()).anchor(0.5, 0.5).size(1.).color(c).draw();
+            }
+        }
+        Ok(())
+    }
+
+    fn interactive(res: &Resource, state: &State) -> bool {
+        res.config.interactive && matches!(state, State::Playing)
+    }
+
+    fn offset(&self) -> f32 {
+        self.chart.offset + self.info_offset + self.res.config.offset
+    }
+
+    fn offset_chart(&self) -> f32 {
+        self.chart.offset + self.info_offset
+    }
+
+    fn tweak_offset(&mut self, ui: &mut Ui, ita: bool, tm: &mut TimeManager) {
+        let width = 0.55;
+        let height = 0.3;
+        ui.scope(|ui| {
+            ui.dx(1. - width - 0.02);
+            ui.dy(ui.top - height - 0.02);
+            ui.fill_rect(Rect::new(0., 0., width, height), Color { r: 0.13, g: 0.13, b: 0.13, a: 0.5 });
+            ui.dy(0.02);
+            ui.text(tl!("adjust-offset")).pos(width / 2., 0.).anchor(0.5, 0.).size(0.7).draw();
+
+            ui.dx(width / 1.22);
+            if ui.button("cancel", Rect::new(0.02, 0., 0.06, 0.06), "×") {
+                self.next_scene = Some(NextScene::PopWithResult(Box::new(Some(self.info_offset))));
+            }
+            ui.dx(-width / 1.22);
+
+            ui.dy(0.20);
+            let r = ui
+                .text(format!("{}ms", (self.info_offset * 1000.).round() as i32))
+                .pos(width / 2., 0.)
+                .anchor(0.5, 0.)
+                .size(0.6)
+                .no_baseline()
+                .draw();
+            let d = 0.14;
+            let mut bpm_list = self.chart.bpm_list.borrow_mut();
+            let beat = (15. / bpm_list.now_bpm(tm.now() as f32)).clamp(0.020, 0.500);
+            if ui.button("lg_sub", Rect::new(d, r.center().y, 0., 0.).feather(0.026), "-") && ita {
+                self.info_offset -= beat;
+            }
+            if ui.button("lg_add", Rect::new(width - d, r.center().y, 0., 0.).feather(0.026), "+") && ita {
+                self.info_offset += beat;
+            }
+            let d = 0.080;
+            if ui.button("sm_sub", Rect::new(d, r.center().y, 0., 0.).feather(0.022), "-") && ita {
+                self.info_offset -= 0.010;
+            }
+            if ui.button("sm_add", Rect::new(width - d, r.center().y, 0., 0.).feather(0.022), "+") && ita {
+                self.info_offset += 0.010;
+            }
+            let d = 0.03;
+            if ui.button("ti_sub", Rect::new(d, r.center().y, 0., 0.).feather(0.017), "-") && ita {
+                self.info_offset -= 0.001;
+            }
+            if ui.button("ti_add", Rect::new(width - d, r.center().y, 0., 0.).feather(0.017), "+") && ita {
+                self.info_offset += 0.001;
+            }
+            /*ui.dy(0.10);
+            let pad = 0.02;
+            let spacing = 0.01;
+            let mut r = Rect::new(pad, 0., (width - pad * 2. - spacing * 2.) / 3., 0.06);
+            if ui.button("cancel", r, tl!("offset-cancel")) {
+                self.next_scene = Some(NextScene::PopWithResult(Box::new(None::<f32>)));
+            }
+            r.x += r.w + spacing;
+            if ui.button("reset", r, tl!("offset-reset")) {
+                self.info_offset = 0.;
+            }
+            r.x += r.w + spacing;
+            if ui.button("save", r, tl!("offset-save")) {
+                //self.res.info.offset = self.info_offset;
+                self.next_scene = Some(NextScene::PopWithResult(Box::new(Some(self.info_offset))));
+            }*/
+        });
+        ui.scope(|ui| {
+            ui.dx(1. - width * 0.97);
+            ui.dy(ui.top - height * 0.75);
+            ui.slider(tl!("speed"), 0.1..2.0, 0.05, &mut self.res.config.speed, Some(0.36));
+            if (tm.speed - self.res.config.speed as f64).abs() > 1e-3 {
+                reset_music_speed!(self, self.res, tm);
+                tm.resume();
+                self.music.play().ok();
+            }
+        });
+    }
+}
+
+impl Scene for GameScene {
+    fn enter(&mut self, tm: &mut TimeManager, target: Option<RenderTarget>) -> Result<()> {
+        #[cfg(target_arch = "wasm32")]
+        on_game_start();
+        self.music = Self::new_music(&mut self.res)?;
+        self.res.camera.render_target = target;
+        tm.speed = self.res.config.speed as _;
+        tm.adjust_time = self.res.config.auto_tweak_offset;
+        reset!(self, self.res, tm);
+        set_camera(&self.res.camera);
+        self.first_in = true;
+        self.pause_rewind = PauseRewind {
+            time: Some(tm.now()),
+            duration: Some(0.1),
+            dim: false,
+        };
+        self.res.disable_hit_fx = true;
+        Ok(())
+    }
+
+    fn pause(&mut self, tm: &mut TimeManager) -> Result<()> {
+        if !tm.paused() {
+            self.pause_rewind = PauseRewind {
+                time: None,
+                duration: None,
+                dim: false
+            };
+            self.music.pause()?;
+            tm.pause();
+        }
+        Ok(())
+    }
+
+    fn resume(&mut self, tm: &mut TimeManager) -> Result<()> {
+        if tm.paused() && !matches!(self.state, State::Playing) {
+            tm.resume();
+        }
+        Ok(())
+    }
+
+    fn foucus_pause(&mut self, tm: &mut TimeManager) -> Result<()> {
+        if !tm.paused() {
+            self.pause_rewind = PauseRewind {
+                time: None,
+                duration: None,
+                dim: false
+            };
+            self.music.pause()?;
+            tm.pause();
+        }
+        Ok(())
+    }
+
+    fn foucus_resume(&mut self, tm: &mut TimeManager) -> Result<()> {
+        if tm.paused() && !matches!(self.state, State::Playing) {
+            tm.resume();
+        }
+        Ok(())
+    }
+
+    fn update(&mut self, tm: &mut TimeManager) -> Result<()> {
+        self.res.audio.recover_if_needed()?;
+        if matches!(self.state, State::Playing) {
+            tm.update(self.music.position() as f64);
+        }
+        if self.mode == GameMode::Exercise && tm.now() > self.exercise_range.end as f64 && self.exercise_range.end < self.res.track_length - 0.1 && !tm.paused() {
+            let state = self.state.clone();
+            reset!(self, self.res, tm);
+            self.state = state;
+            tm.seek_to(self.exercise_range.start as f64);
+            tm.pause();
+            self.music.pause()?;
+        }
+        if tm.paused() {
+            GYRO.lock().unwrap().reset_gyroscope();
+        }
+        let time = tm.now() as f32;
+        let time = match self.state {
+            State::Starting => {
+                #[cfg(target_os = "windows")]
+                { // wtf bro. why must particles exist on Windows?
+                    let emitter_config = self.res.emitter.emitter.config.clone();
+                    let emitter_square_config = self.res.emitter.emitter_square.config.clone();
+                    self.res.emitter.emitter_square.config.rng = None;
+                    self.res.emitter.emitter.config.size = 0.0;
+                    self.res.emitter.emitter_square.config.size = 0.0;
+                    self.res.emitter.emitter.emit(vec2(0.0, 0.0), 1);
+                    self.res.emitter.emitter_square.emit(vec2(0.0, 0.0), 1);
+                    self.res.emitter.emitter.config = emitter_config;
+                    self.res.emitter.emitter_square.config = emitter_square_config;
+                }
+                if time >= Self::BEFORE_DURATION || !self.res.config.enter_animation { // wait for animation
+                    self.res.alpha = 1.;
+                    self.state = State::BeforeMusic;
+                    tm.reset();
+                    tm.seek_to(self.exercise_range.start as f64);
+                    self.last_update_time = tm.real_time();
+                    if self.first_in && self.mode == GameMode::Exercise {
+                        //tm.pause();
+                        //self.music.pause()?;
+                        self.first_in = false;
+                    }
+                    tm.now() as f32
+                } else {
+                    GYRO.lock().unwrap().reset_gyroscope();
+                    if self.res.config.enter_animation {
+                        self.res.alpha = 1. - (1. - time / Self::BEFORE_TIME).clamp(0., 1.).powi(3);
+                    } else {
+                        self.res.alpha = 1.;
+                    };
+                    self.exercise_range.start
+                }
+            }
+            State::BeforeMusic => {
+                if time >= 0.0 {
+                    self.music.seek_to(time as f64)?;
+                    self.music.play()?;
+                    self.state = State::Playing;
+                    self.judge.set_hp_duration(self.res.track_length * 1000.0);
+                }
+                time
+            }
+            State::Playing => {
+                if time >= self.res.track_length + WAIT_TIME {
+                    self.music.pause()?;
+                    self.state = State::Ending;
+                }
+                time
+            }
+            State::Ending => {
+                let t = time - self.res.track_length - WAIT_TIME;
+                if t >= Self::WAIT_AFTER_TIME {
+                    if self.res.config.autoplay() {
+                        self.judge.commit_all(&mut self.chart);
+                    }
+                    let mut record_data = None;
+                    // TODO strengthen the protection
+                    #[cfg(feature = "closed")]
+                    if let Some(upload_fn) = &self.upload_fn {
+                        if !self.res.config.offline_mode && !self.res.config.autoplay() && self.res.config.speed >= 1.0 - 1e-3 {
+                            if let Some(player) = &self.player {
+                                if let Some(chart) = &self.res.info.id {
+                                    record_data = Some(encode_record(self, player.id, *chart));
+                                }
+                            }
+                        }
+                    }
+                    let result = self.judge.result();
+                    let record = if self.res.config.autoplay() || self.res.config.speed < 1.0 - 1e-3 {
+                        None
+                    } else {
+                        Some(SimpleRecord {
+                            score: result.score as _,
+                            accuracy: result.accuracy as _,
+                            full_combo: result.max_combo == result.num_of_notes,
+                        })
+                    };
+                    self.next_scene = match self.mode {
+                        GameMode::Normal | GameMode::Exercise | GameMode::NoRetry | GameMode::View => Some(NextScene::Overlay(Box::new(EndingScene::new(
+                            self.res.background.clone(),
+                            self.res.illustration.clone(),
+                            self.res.player.clone(),
+                            self.res.icons.clone(),
+                            self.res.icon_retry.clone(),
+                            self.res.icon_proceed.clone(),
+                            self.res.info.clone(),
+                            self.judge.result(),
+                            self.res.challenge_icons[self.res.config.challenge_color.clone() as usize].clone(),
+                            &self.res.config,
+                            self.res.res_pack.endings.clone(),
+                            self.upload_fn.as_ref().map(Arc::clone),
+                            self.player.as_ref().map(|it| it.rks),
+                            record_data,
+                            record,
+                        )?))),
+                        GameMode::TweakOffset => Some(NextScene::PopWithResult(Box::new(None::<f32>))),
+                    };
+                }
+                self.res.alpha = 1. - (t / AFTER_TIME).clamp(0., 1.).powi(2);
+                self.res.track_length + WAIT_TIME
+            }
+        };
+
+        let time = if self.mode == GameMode::TweakOffset {
+            time.max(0.) - self.offset_chart()
+        } else if self.res.config.auto_tweak_offset {
+            (time - self.offset() - get_latency(&self.res.audio, &self.res.frame_times) as f32).max(0.)
+        } else {
+            (time - self.offset()).max(0.)
+        };
+        self.res.time = time;
+        if !tm.paused() && (self.res.config.autoplay() || self.pause_rewind.time.is_none()) && self.mode != GameMode::View {
+            self.gl.quad_gl.viewport(self.res.camera.viewport);
+
+            let angle = GYRO.lock().unwrap().get_angle(&self.res.config);
+
+            self.judge.update(&mut self.res, &mut self.chart, &mut self.bad_notes, -angle);
+            self.judge.update_hp(self.res.time * 1000.0);
+            self.gl.quad_gl.viewport(None);
+        }
+        if let Some(update) = &mut self.update_fn {
+            update(self.res.time, &mut self.res, &mut self.judge);
+        }
+        let counts = self.judge.counts();
+        self.res.judge_line_color = if counts[2] + counts[3] == 0 {
+            if counts[1] == 0 {
+                self.res.res_pack.info.line_perfect()
+            } else {
+                self.res.res_pack.info.line_good()
+            }
+        } else {
+            WHITE
+        };
+        self.res.judge_line_color.a *= self.res.alpha;
+        self.chart.update(&mut self.res);
+        let res = &mut self.res;
+        #[cfg(feature = "video")]
+        if !tm.paused() {
+            for video in &mut self.chart.extra.videos {
+                if let Err(err) = video.update(res.time) {
+                    warn!("video error: {err:?}");
+                }
+            }
+        }
+        if res.config.interactive && is_key_pressed(KeyCode::Space) {
+            if tm.paused() {
+                if matches!(self.state, State::Playing) {
+                    let now = tm.now();
+                    if (tm.speed - res.config.speed as f64).abs() > 1e-3 {
+                        reset_music_speed!(self, res, tm);
+                    }
+                    self.music.seek_to(now)?;
+                    self.music.play()?;
+                    tm.seek_to(now);
+                    tm.resume();
+                    self.pause_rewind = PauseRewind {
+                        time: Some(now),
+                        duration: Some(0.1),
+                        dim: false
+                    };
+                    res.disable_hit_fx = true;
+                }
+            } else if matches!(self.state, State::Playing) && !self.pause_rewind.dim { // State::BeforeMusic
+                if !self.music.paused() {
+                    self.music.pause()?;
+                }
+                self.pause_rewind = PauseRewind {
+                    time: None,
+                    duration: None,
+                    dim: false
+                };
+                tm.pause();
+            }
+        }
+        if Self::interactive(res, &self.state) {
+            if is_key_pressed(KeyCode::Left) {
+                res.time -= 2.;
+                let dst = (self.music.position() - 2.).max(0.);
+                self.music.seek_to(dst)?;
+                tm.seek_to(dst as f64);
+            }
+            if is_key_pressed(KeyCode::Right) {
+                res.time += 5.;
+                let dst = (self.music.position() + 5.).min(res.track_length as f64);
+                self.music.seek_to(dst)?;
+                tm.seek_to(dst as f64);
+
+                self.pause_rewind = PauseRewind {
+                    time: Some(tm.now()),
+                    duration: Some(0.1),
+                    dim: false
+                };
+                res.disable_hit_fx = true;
+            }
+            if is_key_pressed(KeyCode::Q) {
+                self.should_exit = true;
+            }
+        }
+        for effect in &mut self.effects {
+            effect.update(&self.res);
+        }
+        if let Some((id, text)) = take_input() {
+            let offset = self.offset().min(0.);
+            match id.as_str() {
+                "exercise_start" => {
+                    if let Some(t) = parse_time(&text) {
+                        if !(offset..self.res.track_length.min(self.exercise_range.end - 3.).max(offset)).contains(&t) {
+                            show_message(tl!("ex-time-out-of-range")).error();
+                        } else {
+                            self.exercise_range.start = t;
+                            show_message(tl!("ex-time-set")).ok();
+                        }
+                    } else {
+                        show_message(tl!("ex-invalid-format")).error();
+                    }
+                }
+                "exercise_end" => {
+                    if let Some(t) = parse_time(&text) {
+                        if !((self.exercise_range.start + 3.).max(offset).min(self.res.track_length)..self.res.track_length).contains(&t) {
+                            show_message(tl!("ex-time-out-of-range")).error();
+                        } else {
+                            self.exercise_range.end = t;
+                            show_message(tl!("ex-time-set")).ok();
+                        }
+                    } else {
+                        show_message(tl!("ex-invalid-format")).error();
+                    }
+                }
+                _ => return_input(id, text),
+            }
+        }
+        Ok(())
+    }
+
+    fn touch(&mut self, tm: &mut TimeManager, touch: &Touch) -> Result<bool> {
+        if self.mode == GameMode::Exercise && tm.paused() {
+            let touch = Touch {
+                position: touch.position * self.touch_scale(),
+                ..touch.clone()
+            };
+            if self.exercise_btns.0.touch(&touch) {
+                request_input("exercise_start", &fmt_time(self.exercise_range.start), tl!("ex-time-start"));
+                return Ok(true);
+            }
+            if self.exercise_btns.1.touch(&touch) {
+                request_input("exercise_end", &fmt_time(self.exercise_range.end), tl!("ex-time-end"));
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn render(&mut self, tm: &mut TimeManager, ui: &mut Ui) -> Result<()> {
+        let res = &mut self.res;
+
+        let time = tm.now() as f32;
+        let p = match self.state {
+            State::Starting => {
+                if time < Self::BEFORE_DURATION {
+                    1. - (1. - time / Self::BEFORE_DURATION)
+                } else {
+                    1.
+                }
+            }
+            State::BeforeMusic => 1.,
+            State::Ending | State::Playing => {
+                let t = time - res.track_length;
+                1. - (t / Self::BEFORE_DURATION).clamp(0., 1.)
+            }
+        };
+        let ratio = if res.config.chart_ratio != 1. && res.config.enter_animation {
+            1. + (res.config.chart_ratio - 1.) * ease_in_out_quartic(p)
+        } else {
+            res.config.chart_ratio
+        };
+
+        if res.update_size(ui.viewport) || self.mode == GameMode::View {
+            set_camera(&res.camera);
+        }
+
+        let msaa = res.config.sample_count > 1;
+
+        // camera setup
+        let vp = res.camera.viewport.unwrap_or(ui.viewport);
+        let asp2_window = ui.viewport.2 as f32 / ui.viewport.3 as f32;
+        let asp2_chart = vp.2 as f32 / vp.3 as f32;
+        let asp2_ui = vp.3 as f32 / vp.2 as f32;
+        let asp2_ui_window = ui.viewport.3 as f32 / ui.viewport.2 as f32;
+
+        let viewport_chart = if res.chart_target.is_some() {
+            Some((vp.0 - ui.viewport.0, vp.1 - ui.viewport.1, vp.2, vp.3))
+        } else {
+            res.camera.viewport
+        };
+        let viewport_window = Some(ui.viewport);
+
+        let chart_onto = res
+            .chart_target
+            .as_ref()
+            .map(|it| if msaa { it.input() } else { it.output() })
+            .or(res.camera.render_target);
+
+        let h = 1. / res.aspect_ratio;
+        set_camera(&Camera2D {
+            zoom: vec2(1., -asp2_window),
+            viewport: if res.chart_target.is_some() { None } else { viewport_window },
+            render_target: chart_onto,
+            ..Default::default()
+        });
+        if res.config.render_bg {
+            clear_background(BLACK);
+            draw_background(*res.background, res.config.render_bg_dim);
+        }
+
+        if res.config.render_bg_dim && res.config.chart_ratio >= 1. {
+            let dim_alpha = 0.7;
+            //let alpha = res.alpha * (1. - dim_alpha) + dim_alpha;    
+            let dim = Color::new(0.1, 0.1, 0.1, dim_alpha * res.alpha);
+            let x_range = vp.0 as f32 / ui.viewport.2 as f32;
+            let y_range =  vp.1 as f32 / vp.3 as f32;
+            draw_rectangle(-1., -h,x_range * 2., h * 2., dim); // Left
+            draw_rectangle(1., -h,-x_range * 2., h * 2., dim); // Right
+            draw_rectangle(-1., -h,2., -y_range * 2., dim); // Top
+            draw_rectangle(-1., h,2., y_range * 2., dim); // Bottom
+            draw_rectangle(x_range * 2. - 1., -h, (1. - x_range * 2.) * 2., h * 2., Color::new(0., 0., 0., res.alpha * res.info.background_dim));
+        }
+
+        let chart_zoom = if res.config.chart_ratio < 1. { vec2(asp2_chart / asp2_window * ratio, -asp2_chart * ratio) } else { vec2(1. * ratio, -asp2_chart * ratio) };
+        let chart_viewport = if res.config.chart_ratio < 1. { viewport_window } else { viewport_chart };
+
+        if res.config.render_bg_dim && res.config.chart_ratio < 1. {
+            set_camera( &Camera2D {
+                zoom: chart_zoom,
+                viewport: chart_viewport,
+                ..Default::default()
+            });
+            self.gl.quad_gl.render_pass(chart_onto.map(|it| it.render_pass));
+            draw_rectangle(-1., -h, 2., h * 2., Color::new(0., 0., 0., res.alpha * res.info.background_dim));
+        }
+
+        let angle = GYRO.lock().unwrap().get_angle(&res.config);
+        set_camera( &Camera2D {
+            zoom: chart_zoom,
+            viewport: chart_viewport.map(|(x, y, w, h)| {
+                if res.info.fold_animation && matches!(self.state, State::Starting) {
+                    let scale_x = (1. - (1. - time / Self::BEFORE_TIME).clamp(0., 1.).powi(3)).powf(2.0);
+                    let new_w = (w as f32 * scale_x).round() as i32;
+                    let dx = (w - new_w) / 2;
+                    (x + dx, y, new_w, h)
+                } else {
+                    (x, y, w, h)
+                }
+            }),
+            rotation: angle.to_degrees(),
+            ..Default::default()
+        });
+        self.gl.quad_gl.render_pass(chart_onto.map(|it| it.render_pass));
+        self.chart.render(ui, res);
+
+        self.gl.quad_gl.render_pass(
+            res.chart_target
+                .as_ref()
+                .map(|it| it.output().render_pass)
+                .or_else(|| res.camera.render_pass()),
+        );
+
+        self.bad_notes.retain(|dummy| dummy.render(res));
+        let t = tm.real_time();
+        let dt = (t - std::mem::replace(&mut self.last_update_time, t)) as f32;
+        if res.config.particle {
+            res.emitter.draw(dt);
+        }
+
+        if !res.no_effect {
+            set_camera(&Camera2D {
+                zoom: vec2(1., asp2_chart),
+                ..Default::default()
+            });
+            for effect in &self.chart.extra.effects {
+                effect.render(res);
+            }
+        }
+        
+        {
+            set_camera(&Camera2D {
+                zoom: if res.config.chart_ratio < 1. { vec2(asp2_ui_window * ratio, -1. * ratio) } else { vec2(asp2_ui * ratio, -1. * ratio) },
+                viewport: chart_viewport,
+                render_target: self.res.chart_target.as_ref().map(|it| it.output()).or(self.res.camera.render_target),
+                ..Default::default()
+            });
+            self.ui(ui, tm)?;
+        }
+
+        if !self.res.no_effect && !self.effects.is_empty() {
+            set_camera(&Camera2D {
+                zoom: vec2(1., asp2_window),
+                ..Default::default()
+            });
+            for effect in &self.effects {
+                effect.render(&mut self.res);
+            }
+        }
+
+        {
+            set_camera(&Camera2D {
+                zoom: vec2(1., 1.),
+                viewport: viewport_window,
+                render_target: self.res.chart_target.as_ref().map(|it| it.output()).or(self.res.camera.render_target),
+                ..Default::default()
+            });
+            if tm.paused() {
+                draw_rectangle(-1., -1., 2., 2., Color::new(0., 0., 0., PAUSE_BACKGROUND_ALPHA));
+            }
+        }
+
+        {
+            set_camera(&Camera2D {
+                zoom: vec2(1., -asp2_window),
+                viewport: viewport_window,
+                render_target: self.res.chart_target.as_ref().map(|it| it.output()).or(self.res.camera.render_target),
+                ..Default::default()
+            });
+            if self.mode == GameMode::TweakOffset {
+                self.tweak_offset(ui, Self::interactive(&self.res, &self.state), tm);
+            }
+            if self.res.config.touch_debug {
+                for touch in Judge::get_touches(1.0) {
+                    ui.fill_circle(touch.position.x, touch.position.y, 0.04, Color { a: 0.4, ..RED });
+                }
+            }
+        }
+        
+        {
+            set_camera(&Camera2D {
+                zoom: vec2(1., -asp2_chart),
+                viewport: viewport_chart,
+                render_target: self.res.chart_target.as_ref().map(|it| it.output()).or(self.res.camera.render_target),
+                ..Default::default()
+            });
+            self.overlay_ui(ui, tm)?;
+        }
+
+        if msaa || !self.res.no_effect {
+            // render the texture onto screen
+            if let Some(target) = &self.res.chart_target {
+                self.gl.flush();
+                self.gl.quad_gl.viewport(None);
+                set_camera(&Camera2D {
+                    zoom: vec2(1., asp2_window),
+                    render_target: self.res.camera.render_target,
+                    viewport: viewport_window,
+                    ..Default::default()
+                });
+                draw_texture_ex(
+                    target.output().texture,
+                    -1.,
+                    -ui.top,
+                    WHITE,
+                    DrawTextureParams {
+                        dest_size: Some(vec2(2., ui.top * 2.)),
+                        ..Default::default()
+                    },
+                );
+            }
+        } else {
+            self.gl.flush();
+        }
+
+        if self.res.config.auto_tweak_offset {
+            push_frame_time(&mut self.res.frame_times, tm.real_time());
+        }
+        
+        Ok(())
+    }
+
+    fn next_scene(&mut self, tm: &mut TimeManager) -> NextScene {
+        if self.should_exit {
+            if tm.paused() {
+                tm.resume();
+            }
+            tm.speed = 1.0;
+            tm.adjust_time = false;
+            match self.mode {
+                GameMode::Normal | GameMode::Exercise | GameMode::NoRetry | GameMode::View => NextScene::Pop,
+                GameMode::TweakOffset => NextScene::PopWithResult(Box::new(None::<f32>)),
+            }
+        } else if let Some(next_scene) = self.next_scene.take() {
+            tm.speed = 1.0;
+            tm.adjust_time = false;
+            next_scene
+        } else {
+            NextScene::None
+        }
+    }
+}

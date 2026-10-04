@@ -1,0 +1,16 @@
+[workspace]
+members = [
+	"phire",
+	"prpr-avc",
+	"prpr-pbc",
+	"phire-ui",
+	"phire-main",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 2
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,101 @@
+name: Build PhiWOW APK
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  ANDROID_NDK_HOME: ${{github.workspace}}/android-ndk-r26d
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Android NDK
+      run: |
+        wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
+        unzip -q android-ndk-r26d-linux.zip -d ${{github.workspace}}
+
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1.0.6
+      with:
+        toolchain: stable
+        targets: aarch64-linux-android,armv7-linux-androideabi
+
+    - name: Install cargo-ndk
+      run: cargo install cargo-ndk
+
+    - name: Build arm64-v8a .so
+      run: |
+        cd phire-ui
+        cargo ndk -t arm64-v8a -o ./android/app/src/main/jniLibs build --release
+
+    - name: Build armeabi-v7a .so
+      run: |
+        cd phire-ui
+        cargo ndk -t armeabi-v7a -o ./android/app/src/main/jniLibs build --release
+
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 17
+
+    - name: Compile Java to DEX
+      run: |
+        SDK="${{github.workspace}}/android-sdk"
+        # Use Android SDK build-tools from NDK
+        BT="${{github.workspace}}/android-ndk-r26d/build-tools"
+        # Install Android SDK command-line tools for aapt2
+        wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdtools.zip
+        mkdir -p $SDK/cmdline-tools
+        unzip -q cmdtools.zip -d $SDK/cmdline-tools-tmp
+        mv $SDK/cmdline-tools-tmp/cmdline-tools $SDK/cmdline-tools/latest
+        
+        # Accept licenses and install build-tools
+        yes | $SDK/cmdline-tools/latest/bin/sdkmanager --sdk_root=$SDK "build-tools;30.0.2" "platforms;android-30" > /dev/null 2>&1 || true
+        
+        BT="$SDK/build-tools/30.0.2"
+        JAR="$SDK/platforms/android-30/android.jar"
+        JAVA_HOME="${{env.JAVA_HOME}}"
+        
+        # Find javac
+        JAVAC="$JAVA_HOME/bin/javac"
+        JAR_CMD="$JAVA_HOME/bin/jar"
+        JAVA_CMD="$JAVA_HOME/bin/java"
+        DXJAR=$(find $SDK -name "dx.jar" | head -1)
+        
+        # Compile Java
+        mkdir -p build_classes
+        find android/app/src/main/java -name "*.java" > build_sources.txt
+        $JAVAC --release 8 -classpath "$JAR" -d build_classes @build_sources.txt
+        
+        # Generate DEX
+        $JAR_CMD cf build_classes.jar -C build_classes .
+        $JAVA_CMD -cp "$DXJAR" com.android.dx.command.Main --dex --output=origin/classes.dex --min-sdk-version=21 build_classes.jar
+        
+        # Build manifest
+        $BT/aapt2 compile android/app/src/main/res/values/strings.xml -o compiled_strings.zip
+        $BT/aapt2 link -o manifest_fixed.zip --manifest android/app/src/main/AndroidManifest.xml -I "$JAR" -R compiled_strings.zip --auto-add-overlay --rename-manifest-package com.hlmc.phire
+        python3 -c "import zipfile; zipfile.ZipFile('manifest_fixed.zip','r').extract('AndroidManifest.xml','origin_temp')"
+        cp origin_temp/AndroidManifest.xml origin/AndroidManifest.xml
+
+    - name: Package APK
+      run: python3 package_apk.py
+
+    - name: Align and Sign
+      run: |
+        SDK="${{github.workspace}}/android-sdk"
+        BT="$SDK/build-tools/30.0.2"
+        $BT/zipalign -f 4 installed_raw.apk installed_aligned.apk
+        $BT/apksigner sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android --out installed.apk installed_aligned.apk
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: PhiWOW-apk
+        path: installed.apk
