@@ -59,8 +59,8 @@ jobs:
         unzip -q cmdtools.zip -d $SDK/cmdline-tools-tmp
         mv $SDK/cmdline-tools-tmp/cmdline-tools $SDK/cmdline-tools/latest
 
-        # Accept licenses and install build-tools
-        yes | $SDK/cmdline-tools/latest/bin/sdkmanager --sdk_root=$SDK "build-tools;34.0.0" "platforms;android-34"
+        # Accept licenses and install build-tools + commandlinetools (contains d8)
+        yes | $SDK/cmdline-tools/latest/bin/sdkmanager --sdk_root=$SDK "build-tools;34.0.0" "platforms;android-34" "commandlinetools;latest"
 
         BT="$SDK/build-tools/34.0.0"
         JAR="$SDK/platforms/android-34/android.jar"
@@ -69,16 +69,18 @@ jobs:
         JAVAC="$JAVA_HOME/bin/javac"
         JAR_CMD="$JAVA_HOME/bin/jar"
         JAVA_CMD="$JAVA_HOME/bin/java"
+
+        # Find d8.jar from installed commandlinetools
+        D8_JAR=$(find $SDK -name "d8.jar" | head -1)
+        if [ -z "$D8_JAR" ]; then
+          echo "ERROR: d8.jar not found in $SDK"; find $SDK -name "*.jar" | head -10; exit 1
+        fi
+
         # Generate DEX using d8 (dx was removed in build-tools 34)
         mkdir -p build_classes origin origin_temp
         find android/app/src/main/java -name "*.java" > build_sources.txt
         $JAVAC --release 8 -classpath "$JAR" -d build_classes @build_sources.txt
         $JAR_CMD cf build_classes.jar -C build_classes .
-        D8_JAR="$SDK/cmdline-tools/latest/lib/common/d8.jar"
-        if [ ! -f "$D8_JAR" ]; then
-          echo "ERROR: d8.jar not found at $D8_JAR"
-          exit 1
-        fi
         $JAVA_CMD -cp "$D8_JAR" com.android.tools.r8.D8 --min-api 21 --output origin/classes.dex build_classes.jar
         echo "DEX generation succeeded"
 
