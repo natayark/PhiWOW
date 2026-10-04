@@ -69,21 +69,9 @@ jobs:
         JAVAC="$JAVA_HOME/bin/javac"
         JAR_CMD="$JAVA_HOME/bin/jar"
         JAVA_CMD="$JAVA_HOME/bin/java"
-        DXJAR=$(find $SDK -name "dx.jar" | head -1)
-        if [ -z "$DXJAR" ]; then
-          echo "ERROR: dx.jar not found in $SDK"
-          find $SDK -name "*.jar" 2>/dev/null | head -20
-          exit 1
-        fi
-        echo "Found dx.jar: $DXJAR"
-
-        mkdir -p build_classes origin origin_temp
-        find android/app/src/main/java -name "*.java" > build_sources.txt
-        $JAVAC --release 8 -classpath "$JAR" -d build_classes @build_sources.txt
-        echo "Java compilation succeeded"
-
+        # Generate DEX using d8 (dx was removed in build-tools 34)
         $JAR_CMD cf build_classes.jar -C build_classes .
-        $JAVA_CMD -cp "$DXJAR" com.android.dx.command.Main --dex --output=origin/classes.dex --min-sdk-version=21 build_classes.jar
+        $JAVA_CMD -cp "$DXJAR" com.android.tools.r8.d8.Main --min-api 21 --output origin/classes.dex build_classes.jar
         echo "DEX generation succeeded"
 
         $BT/aapt2 compile android/app/src/main/res/values/strings.xml -o compiled_strings.zip
