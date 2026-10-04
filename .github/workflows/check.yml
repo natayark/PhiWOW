@@ -18,6 +18,10 @@ jobs:
       with:
         toolchain: stable
         profile: minimal
+        targets: aarch64-linux-android,armv7-linux-androideabi
+
+    - name: Install cargo-ndk
+      run: cargo install cargo-ndk
 
     - name: Run cargo check
       run: cargo check --workspace
