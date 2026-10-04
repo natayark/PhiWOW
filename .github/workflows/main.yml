@@ -59,11 +59,8 @@ jobs:
         unzip -q cmdtools.zip -d $SDK/cmdline-tools-tmp
         mv $SDK/cmdline-tools-tmp/cmdline-tools $SDK/cmdline-tools/latest
 
-        # Pre-accept all licenses first
-        yes | $SDK/cmdline-tools/latest/bin/sdkmanager --sdk_root=$SDK --licenses > /dev/null 2>&1 || true
-
-        # Install build-tools and platforms
-        $SDK/cmdline-tools/latest/bin/sdkmanager --sdk_root=$SDK "build-tools;34.0.0" "platforms;android-34"
+        # Accept licenses and install build-tools
+        yes | $SDK/cmdline-tools/latest/bin/sdkmanager --sdk_root=$SDK "build-tools;34.0.0" "platforms;android-34"
 
         BT="$SDK/build-tools/34.0.0"
         JAR="$SDK/platforms/android-34/android.jar"
@@ -74,21 +71,26 @@ jobs:
         JAVA_CMD="$JAVA_HOME/bin/java"
         DXJAR=$(find $SDK -name "dx.jar" | head -1)
         if [ -z "$DXJAR" ]; then
-          echo "ERROR: dx.jar not found"
+          echo "ERROR: dx.jar not found in $SDK"
           find $SDK -name "*.jar" 2>/dev/null | head -20
           exit 1
         fi
+        echo "Found dx.jar: $DXJAR"
 
         mkdir -p build_classes origin origin_temp
         find android/app/src/main/java -name "*.java" > build_sources.txt
         $JAVAC --release 8 -classpath "$JAR" -d build_classes @build_sources.txt
+        echo "Java compilation succeeded"
+
         $JAR_CMD cf build_classes.jar -C build_classes .
         $JAVA_CMD -cp "$DXJAR" com.android.dx.command.Main --dex --output=origin/classes.dex --min-sdk-version=21 build_classes.jar
+        echo "DEX generation succeeded"
 
         $BT/aapt2 compile android/app/src/main/res/values/strings.xml -o compiled_strings.zip
         $BT/aapt2 link -o manifest_fixed.zip --manifest android/app/src/main/AndroidManifest.xml -I "$JAR" -R compiled_strings.zip --auto-add-overlay --rename-manifest-package com.hlmc.phire
         python3 -c "import zipfile; zipfile.ZipFile('manifest_fixed.zip','r').extract('AndroidManifest.xml','origin_temp')"
         cp origin_temp/AndroidManifest.xml origin/AndroidManifest.xml
+        echo "Manifest processing succeeded"
 
     - name: Package APK
       run: python3 package_apk.py
