@@ -70,6 +70,9 @@ jobs:
         JAR_CMD="$JAVA_HOME/bin/jar"
         JAVA_CMD="$JAVA_HOME/bin/java"
         # Generate DEX using d8 (dx was removed in build-tools 34)
+        mkdir -p build_classes origin origin_temp
+        find android/app/src/main/java -name "*.java" > build_sources.txt
+        $JAVAC --release 8 -classpath "$JAR" -d build_classes @build_sources.txt
         $JAR_CMD cf build_classes.jar -C build_classes .
         D8_JAR="$SDK/cmdline-tools/latest/lib/common/d8.jar"
         if [ ! -f "$D8_JAR" ]; then
