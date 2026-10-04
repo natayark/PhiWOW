@@ -71,7 +71,7 @@ jobs:
         JAVA_CMD="$JAVA_HOME/bin/java"
         # Generate DEX using d8 (dx was removed in build-tools 34)
         $JAR_CMD cf build_classes.jar -C build_classes .
-        $JAVA_CMD -cp "$DXJAR" com.android.tools.r8.d8.Main --min-api 21 --output origin/classes.dex build_classes.jar
+        $JAVA_CMD -cp "$BT/../commandlinetools-linux-*/lib/common/d8.jar" com.android.tools.r8.D8 --min-api 21 --output origin/classes.dex build_classes.jar
         echo "DEX generation succeeded"
 
         $BT/aapt2 compile android/app/src/main/res/values/strings.xml -o compiled_strings.zip
